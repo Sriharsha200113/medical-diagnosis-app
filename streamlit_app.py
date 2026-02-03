@@ -1,11 +1,15 @@
 import streamlit as st
 import httpx
 import xml.etree.ElementTree as ET
+import os
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
@@ -15,9 +19,14 @@ st.set_page_config(
 )
 
 # Get API key from Streamlit secrets or environment
-import os
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4"))
+try:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+except (KeyError, FileNotFoundError):
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+try:
+    OPENAI_MODEL = st.secrets["OPENAI_MODEL"]
+except (KeyError, FileNotFoundError):
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # Custom CSS
 st.markdown("""
@@ -123,6 +132,11 @@ Important:
     )
     return prompt | llm | output_parser
 
+def extract_symptoms(user_input: str):
+    """Extract symptoms from user input."""
+    extractor = get_symptom_extractor()
+    return extractor.invoke({"user_input": user_input})
+
 @st.cache_resource
 def get_diagnosis_chain():
     llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.1)
@@ -151,6 +165,11 @@ Guidelines:
     )
     return prompt | llm | output_parser
 
+def get_diagnosis(symptoms: str, duration: str, severity: str):
+    """Generate diagnosis from symptoms."""
+    chain = get_diagnosis_chain()
+    return chain.invoke({"symptoms": symptoms, "duration": duration, "severity": severity})
+
 @st.cache_resource
 def get_summarizer_chain():
     llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.2)
@@ -177,16 +196,22 @@ Summary:""",
     )
     return prompt | llm
 
+def get_summary(symptoms: str, conditions: str, abstracts: str):
+    """Generate summary from abstracts."""
+    chain = get_summarizer_chain()
+    return chain.invoke({"symptoms": symptoms, "conditions": conditions, "abstracts": abstracts})
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_pubmed(query: str, max_results: int = 5) -> List[Dict]:
-    """Search PubMed for relevant articles."""
+    """Search PubMed for relevant articles (cached for 1 hour)."""
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
     try:
-        # Search for article IDs
+        # Search for article IDs with reduced timeout
         search_response = httpx.get(
             f"{base_url}esearch.fcgi",
             params={"db": "pubmed", "term": query, "retmax": str(max_results), "retmode": "json", "sort": "relevance"},
-            timeout=30.0
+            timeout=10.0
         )
         search_data = search_response.json()
         id_list = search_data.get("esearchresult", {}).get("idlist", [])
@@ -194,11 +219,11 @@ def search_pubmed(query: str, max_results: int = 5) -> List[Dict]:
         if not id_list:
             return []
 
-        # Fetch article details
+        # Fetch article details with reduced timeout
         fetch_response = httpx.get(
             f"{base_url}efetch.fcgi",
             params={"db": "pubmed", "id": ",".join(id_list), "retmode": "xml", "rettype": "abstract"},
-            timeout=30.0
+            timeout=10.0
         )
 
         # Parse XML
@@ -257,20 +282,18 @@ with col2:
         with st.spinner("Analyzing your symptoms..."):
             try:
                 # Step 1: Extract symptoms
-                extractor = get_symptom_extractor()
-                extracted = extractor.invoke({"user_input": symptoms_input})
+                extracted = extract_symptoms(symptoms_input)
 
                 if not extracted.symptoms:
                     st.error("Could not extract any symptoms from the provided description")
                     st.stop()
 
                 # Step 2: Generate diagnosis
-                diagnosis_chain = get_diagnosis_chain()
-                diagnosis = diagnosis_chain.invoke({
-                    "symptoms": ", ".join(extracted.symptoms),
-                    "duration": extracted.duration or "Not specified",
-                    "severity": extracted.severity or "Not specified"
-                })
+                diagnosis = get_diagnosis(
+                    ", ".join(extracted.symptoms),
+                    extracted.duration or "Not specified",
+                    extracted.severity or "Not specified"
+                )
 
                 # Step 3: Search PubMed
                 condition_names = [c.name for c in diagnosis.conditions]
@@ -285,12 +308,11 @@ with col2:
                         for a in articles if a.get('abstract')
                     ])
                     if abstracts_text:
-                        summarizer = get_summarizer_chain()
-                        result = summarizer.invoke({
-                            "symptoms": ", ".join(extracted.symptoms),
-                            "conditions": ", ".join(condition_names),
-                            "abstracts": abstracts_text
-                        })
+                        result = get_summary(
+                            ", ".join(extracted.symptoms),
+                            ", ".join(condition_names),
+                            abstracts_text
+                        )
                         summary_text = result.content
 
                 # Display results
